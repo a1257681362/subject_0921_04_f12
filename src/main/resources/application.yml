@@ -1,0 +1,150 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: evops-base
+  profiles:
+    active: dev
+  servlet:
+    multipart:
+      # 交车照片上传（photo-1）：现场原图最大 20MB
+      max-file-size: 20MB
+      max-request-size: 20MB
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  datasource:
+    url: jdbc:h2:file:./data/evops;AUTO_SERVER=TRUE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+    # 档期并发放置经 t_vehicle 行锁串行化判定：H2 默认锁等待仅 1s，
+    # 放宽到 5s，让后到事务短暂等待先行者提交后再判冲突，而不是直接锁超时报错。
+    hikari:
+      connection-init-sql: SET LOCK_TIMEOUT 5000
+  h2:
+    console:
+      enabled: false
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+  # 租车单相关表结构版本管理（rental-schema-1）：Flyway 接管 t_vehicle / t_rental_order /
+  # t_rental_handover / t_rental_order_event / t_rental_order_transition /
+  # t_rental_order_name_index / t_idempotent_request 七张表，脚本见 db/migration；
+  # 其余表仍由上面 spring.sql.init 的 schema.sql 幂等初始化，两边互不越界。
+  # 命名规范 / 不可改与可重跑约定 / 失败定位 / 配置项默认值，见 docs/schema/README.md。
+  flyway:
+    enabled: true
+    # 迁移脚本目录：V<递增版本>__<说明>.sql；已执行脚本禁止修改（下方校验和兜底）
+    locations: classpath:db/migration
+    # 变更留档表：逐次记录版本/描述/脚本名/校验和/执行耗时/成败
+    table: flyway_schema_history
+    # 存量库接管：无留档表的非空库先打基线标记再执行脚本；V1 全语句幂等，老库执行即收敛
+    baseline-on-migrate: true
+    baseline-version: 0
+    # 已执行脚本不许改：每次启动校验留档校验和与脚本一致，被篡改直接拒绝启动
+    validate-on-migrate: true
+    # 禁用 clean，防误清库
+    clean-disabled: true
+    encoding: UTF-8
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.evops
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 对账周期任务（recon-1）：cron 可配，改点不动代码；enabled=false 为应急总开关
+evops:
+  # 登录态多端会话（auth-1）：JWT 访问令牌短期有效、刷新令牌一次性轮换、改密全端下线。
+  # 生产部署务必覆盖 jwt.secret（≥32 字节，建议经环境变量 EVOPS_AUTH_JWT_SECRET 注入）。
+  auth:
+    enabled: true
+    jwt:
+      # 开发默认密钥仅用于本地零配置启动；生产检测到默认值会在启动日志打 WARN
+      secret: ${EVOPS_AUTH_JWT_SECRET:evops-dev-only-secret-key-please-change-0123456789}
+      # 访问令牌有效期（秒）：30 分钟，过期前端凭刷新令牌无感换新
+      access-token-ttl-seconds: 1800
+      issuer: evops
+    refresh:
+      # 刷新令牌（会话）有效期（天）
+      ttl-days: 7
+    # 库中无账号时首次启动创建引导管理员；创建后请尽快登录改密或建专属管理员
+    bootstrap:
+      enabled: true
+      username: admin
+      password: admin123
+      display-name: 引导管理员
+  # 周转率统计（turnover-1）：当天快照可重算，凌晨关账冻结前一业务日。
+  turnover:
+    enabled: true
+    # 凌晨关账作业（默认每天 04:00，避开对账 02:00/03:00 作业）
+    daily-close-cron: "0 0 4 * * ?"
+  # 车辆档期（schedule-1）：预约占位统一系统管理。冲突按区间重叠（含前后缓冲）判定；
+  # 占位需在锁位时限内确认，取消或超时未确认自动释放；冲突推荐最近空档。本期不含审批流。
+  schedule:
+    enabled: true
+    # 每段占用前后各留的缓冲（分钟）：新区间与相邻占用间隔小于该值即冲突，恰为该值允许
+    buffer-minutes: 12
+    # 占位锁位时限（分钟）：HELD 到期未确认由周期作业自动置 EXPIRED 释放
+    lock-ttl-minutes: 25
+    # 超时占位扫描周期（默认每分钟；H2/单实例，靠行级锁与懒过期兜底并发）
+    release-cron: "0 * * * * ?"
+  # 交车生命周期状态机（rental-fsm-1）：合法路径集中在此配置，代码不硬编码状态判断。
+  # 越级（如 CREATED 直接 ARCHIVE）、回退（如 RENTING 退回 CREATED）、未知动作都因
+  # “不在合法路径内”被统一拒绝。新增状态/动作只在此加规则并重启生效，不改代码；
+  # 纯状态动作经 POST /api/orders/{id}/transitions 直接承载。
+  # 交车/还车为专属动作（必须登记油量与车损照片），不在通用流转接口开放。
+  rental:
+    fsm:
+      initial-status: CREATED
+      status-names:
+        CREATED: 已下单
+        RENTING: 租用中
+        SETTLED: 已结算
+        ARCHIVED: 已归档
+        REVERSED: 已冲销
+      action-names:
+        PICKUP: 交车
+        RETURN: 还车结算
+        ARCHIVE: 归档
+        REVERSE: 冲销
+      transitions:
+        - { action: PICKUP,  from: CREATED,  to: RENTING,  forward: true,  note: 交车，须登记油量与车损照片 }
+        - { action: RETURN,  from: RENTING,  to: SETTLED,  forward: true,  note: 还车结算，须登记油量与车损照片 }
+        - { action: ARCHIVE, from: SETTLED,  to: ARCHIVED, forward: true,  note: 已结算单据归档 }
+        - { action: REVERSE, from: SETTLED,  to: REVERSED, forward: false, note: 已结算冲销（唯一撤销方式） }
+        - { action: REVERSE, from: ARCHIVED, to: REVERSED, forward: false, note: 已归档冲销（唯一撤销方式） }
+  recon:
+    enabled: true
+    # 夜间配置批处理：白天排队的配置变更统一在此时校验生效（默认每天 02:00）
+    config-apply-cron: "0 0 2 * * ?"
+    # 凌晨日结对账：拉前一业务日双方流水勾稽并出对账单（默认每天 03:00）
+    daily-recon-cron: "0 0 3 * * ?"
+  # 车载定位平台文件往来（telematics-1）
+  telematics:
+    # 导出文件归档根目录（按业务日 yyyyMMdd 分目录落盘）
+    export-dir: data/telematics/export
+    # 文件往来字符集（与对方规范一致，如对方要求 GBK 改此配置）
+    charset: UTF-8
+  # 交车照片标识（photo-1）：上传只落原图+登记，摆正/缩放/水印在后台线程池处理。
+  # 对外只提供 280px 水印预览图（网点标识+订单号，透明度 30%），原图仅内部留存。
+  photo:
+    # 照片落盘根目录（按订单分目录：orig_<hash>.<ext> 原图 / preview_<hash>.jpg 预览图）
+    dir: data/photos
+    # 预览图最长边像素（Thumbnailator 缩放，小图不放大）
+    preview-size: 280
+    # 水印不透明度（0-1，0.30 = 30%）
+    watermark-opacity: 0.30
+    # 后台处理线程池：上传接口只登记即返回，处理在池内异步执行
+    executor:
+      core-size: 2
+      max-size: 4
+      queue-capacity: 200
+
+logging:
+  level:
+    com.evops: INFO
