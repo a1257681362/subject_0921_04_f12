@@ -36,4 +36,10 @@ public interface BranchMapper extends BaseMapper<Branch> {
             + " WHERE c.descendant_id = #{nodeId} AND c.depth > 0"
             + " ORDER BY c.depth DESC")
     List<BranchNode> selectAncestors(@Param("nodeId") Long nodeId);
+
+    /** 子树全部节点的网点编码（含自身）：区域合并归属改派的范围集合。 */
+    @Select("SELECT b.branch_code FROM t_branch b"
+            + " JOIN t_branch_closure c ON c.descendant_id = b.id"
+            + " WHERE c.ancestor_id = #{rootId}")
+    List<String> selectSubtreeCodes(@Param("rootId") Long rootId);
 }

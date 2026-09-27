@@ -4,19 +4,19 @@ import com.baomidou.mybatisplus.annotation.TableName;
 import com.evops.common.BizEntity;
 
 /**
- * 网点树变更留痕：建点 / 子树迁移 / 同级排序。
+ * 网点树变更留痕：建点 / 子树迁移 / 同级排序 / 区域合并。
  * 闭包表是派生数据不随行留痕，操作审计以本表为准（试点观察期的审计依据）。
  */
 @TableName("t_branch_event")
 public class BranchEvent extends BizEntity {
 
-    /** 发生变更的节点 id（迁移时为被迁子树的根） */
+    /** 发生变更的节点 id（迁移/合并时为被迁子树的根） */
     private Long branchId;
 
-    /** CREATE / MOVE / SORT */
+    /** CREATE / MOVE / SORT / MERGE */
     private String eventType;
 
-    /** 变更明细（如 父节点 0 -> 5、排序 0 -> 3） */
+    /** 变更明细（如 父节点 0 -> 5、排序 0 -> 3、合并改派车辆/租车单行数） */
     private String detail;
 
     public Long getBranchId() { return branchId; }

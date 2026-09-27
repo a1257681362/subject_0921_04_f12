@@ -1,9 +1,11 @@
 package com.evops.branch;
 
 import com.evops.branch.dto.BranchCreateRequest;
+import com.evops.branch.dto.MergeRequest;
 import com.evops.branch.dto.MoveRequest;
 import com.evops.branch.dto.SortRequest;
 import com.evops.common.BizException;
+import com.evops.common.RequestContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -13,9 +15,14 @@ import java.util.List;
  * 网点树主流程（闭包表）。
  *
  * 规则：
- * - 建点/子树迁移/排序配置的多表写入共用一个事务，中途失败全部回退；
+ * - 建点/子树迁移/区域合并/排序配置的多表写入共用一个事务，中途失败全部回退；
  * - 子树迁移原子完成：防成环校验 -> 删子树外部旧链路（内部链路保留）->
  *   接新祖先链 -> 改 parent_id（乐观锁）-> 写 MOVE 事件；
+ * - 区域合并原子完成：源子树全部网点的业务归属（车辆台账、租车单）改派到目标网点
+ *   -> 源子树整体挂到目标节点下（与迁移同一套闭包步骤）-> 写 MERGE 事件。
+ *   归属改派与树迁移必须同事务：只搬树不改派时，被并网点名下车辆/订单仍挂在源编码上，
+ *   而周转率/对账等报表一律按 branch_code 扁平汇总（不按闭包层级上卷），
+ *   源编码停用后这块数据会从区域汇总里整块消失（数据其实还在）；
  * - 闭包表为派生索引数据，不随行业务四要素，变更留痕在 t_branch_event；
  * - 网点全量留痕，不提供物理删除；
  * - 调度查询读路径（children/subtree/path）过灰度闸 BranchGrayGate。
@@ -26,13 +33,16 @@ public class BranchService {
     private final BranchMapper branchMapper;
     private final BranchClosureMapper closureMapper;
     private final BranchEventMapper eventMapper;
+    private final BranchOwnershipMapper ownershipMapper;
     private final BranchGrayGate grayGate;
 
     public BranchService(BranchMapper branchMapper, BranchClosureMapper closureMapper,
-                         BranchEventMapper eventMapper, BranchGrayGate grayGate) {
+                         BranchEventMapper eventMapper, BranchOwnershipMapper ownershipMapper,
+                         BranchGrayGate grayGate) {
         this.branchMapper = branchMapper;
         this.closureMapper = closureMapper;
         this.eventMapper = eventMapper;
+        this.ownershipMapper = ownershipMapper;
         this.grayGate = grayGate;
     }
 
@@ -103,9 +113,57 @@ public class BranchService {
 
         recordEvent(nodeId, EventType.MOVE,
                 "子树迁移：父节点 " + oldParentId + " -> " + newParentId
-                        + (request.getReason() != null && !request.getReason().trim().isEmpty()
-                        ? "，原因：" + request.getReason().trim() : ""));
+                        + reasonSuffix(request.getReason()));
         return branchMapper.selectById(nodeId);
+    }
+
+    /**
+     * 区域合并（原子）：源网点整棵子树的业务归属改派到目标网点，源子树挂到目标节点下。
+     * 一个事务内：
+     * 1. 校验：目标存在；禁止合并到自身；禁止目标落在源子树内（防成环）；
+     * 2. 归属改派：源子树全部网点编码名下的车辆台账、租车单 -> 目标网点编码
+     *    （未分派为空的不属于任何网点，不动；历史快照——交接照片网点快照、
+     *    对账流水、周转率已关账快照——不改写）；
+     * 3. 树迁移：与 move 同一套闭包步骤，删旧外部链路、接目标祖先链、改 parent_id（乐观锁）；
+     * 4. 写 MERGE 事件（含改派行数，审计可按数核对）。
+     * 中途任何失败整体回滚：归属不留半截改派，树上不留半截链路。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public Branch merge(Long sourceId, MergeRequest request) {
+        Long targetId = request.getTargetId();
+        Branch source = requireBranch(sourceId);
+        Branch target = requireBranch(targetId);
+        if (sourceId.equals(targetId)) {
+            throw new BizException("不能把网点合并到自身：" + sourceId);
+        }
+        // 防成环：目标落在源子树内时，"子树挂到目标下"会把祖先挂进自己的后代
+        if (closureMapper.countLink(sourceId, targetId) > 0) {
+            throw new BizException("目标网点位于被合并网点的子树内，合并会成环，已拒绝：" + targetId);
+        }
+
+        // 1. 归属改派（先改派后搬树，同事务同生共死）
+        List<String> subtreeCodes = branchMapper.selectSubtreeCodes(sourceId);
+        String operator = RequestContext.operator();
+        String requestNo = RequestContext.requestNo();
+        int vehicles = ownershipMapper.reassignVehicles(subtreeCodes, target.getBranchCode(), operator, requestNo);
+        int orders = ownershipMapper.reassignRentalOrders(subtreeCodes, target.getBranchCode(), operator, requestNo);
+
+        // 2. 树迁移：删旧外部链路（含源已在目标下的既有链路）-> 接目标祖先链 -> 改父指针
+        long oldParentId = source.getParentId();
+        closureMapper.deleteExternalLinks(sourceId);
+        closureMapper.insertLinksUnder(sourceId, targetId);
+        source.setParentId(targetId);
+        int updated = branchMapper.updateById(source);
+        if (updated == 0) {
+            throw new BizException("节点已被并发修改，请刷新后重试：" + sourceId);
+        }
+
+        recordEvent(sourceId, EventType.MERGE,
+                "区域合并：整棵子树并入 " + target.getBranchCode() + "（节点 " + targetId + "），父节点 "
+                        + oldParentId + " -> " + targetId
+                        + "，改派车辆 " + vehicles + " 台、租车单 " + orders + " 笔"
+                        + reasonSuffix(request.getReason()));
+        return branchMapper.selectById(sourceId);
     }
 
     /** 同级排序配置：sort_order 小的在前，同值按 id。 */
@@ -169,11 +227,17 @@ public class BranchService {
         eventMapper.insert(event);
     }
 
+    /** 事件留痕的原因后缀（可空，空则不带）。 */
+    private static String reasonSuffix(String reason) {
+        return reason != null && !reason.trim().isEmpty() ? "，原因：" + reason.trim() : "";
+    }
+
     /** 事件类型常量 */
     public static final class EventType {
         public static final String CREATE = "CREATE";
         public static final String MOVE = "MOVE";
         public static final String SORT = "SORT";
+        public static final String MERGE = "MERGE";
 
         private EventType() {}
     }

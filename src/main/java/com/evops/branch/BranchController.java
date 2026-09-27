@@ -1,6 +1,7 @@
 package com.evops.branch;
 
 import com.evops.branch.dto.BranchCreateRequest;
+import com.evops.branch.dto.MergeRequest;
 import com.evops.branch.dto.MoveRequest;
 import com.evops.branch.dto.SortRequest;
 import com.evops.common.ApiResponse;
@@ -39,6 +40,16 @@ public class BranchController {
     public ApiResponse<Branch> move(@PathVariable Long id,
                                     @Valid @RequestBody MoveRequest request) {
         return ApiResponse.ok(branchService.move(id, request));
+    }
+
+    /**
+     * 区域合并（原子）：源网点整棵子树的车辆/租车单归属改派到目标网点，
+     * 源子树整体挂到目标节点下；中途失败整体回滚，不留半截改派/链路。
+     */
+    @PostMapping("/{id}/merge")
+    public ApiResponse<Branch> merge(@PathVariable Long id,
+                                     @Valid @RequestBody MergeRequest request) {
+        return ApiResponse.ok(branchService.merge(id, request));
     }
 
     /** 同级排序配置 */
